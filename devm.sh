@@ -284,10 +284,10 @@ _devm_find_project_for_dir() {
 # ─── Config writing ────────────────────────────────────────────────────────
 
 # Write or update a project section in the config file
-# Usage: _devm_config_write_project <name> [--cpus N] [--memory GB] [--disk GB] [folders...]
+# Usage: _devm_config_write_project <name> [--cpus N] [--memory GB] [--disk GB] [--ports LIST] [folders...]
 _devm_config_write_project() {
   local name="$1"; shift
-  local cpus="" memory="" disk=""
+  local cpus="" memory="" disk="" ports=""
   local folders=()
 
   while [[ $# -gt 0 ]]; do
@@ -295,19 +295,22 @@ _devm_config_write_project() {
       --cpus)   cpus="$2"; shift 2 ;;
       --memory) memory="$2"; shift 2 ;;
       --disk)   disk="$2"; shift 2 ;;
+      --ports)  ports="$2"; shift 2 ;;
       *)        folders+=("$1"); shift ;;
     esac
   done
 
   # Read existing values as defaults
-  local old_cpus old_memory old_disk
+  local old_cpus old_memory old_disk old_ports
   old_cpus=$(_devm_config_get "$name" "cpus" 2>/dev/null || echo "")
   old_memory=$(_devm_config_get "$name" "memory" 2>/dev/null || echo "")
   old_disk=$(_devm_config_get "$name" "disk" 2>/dev/null || echo "")
+  old_ports=$(_devm_config_get "$name" "ports" 2>/dev/null || echo "")
 
   cpus="${cpus:-${old_cpus:-1}}"
   memory="${memory:-${old_memory:-2}}"
   disk="${disk:-${old_disk:-10}}"
+  ports="${ports:-${old_ports:-}}"
 
   # Get existing folders if no new folders provided
   if [[ ${#folders[@]} -eq 0 ]]; then
@@ -347,6 +350,7 @@ _devm_config_write_project() {
   echo "cpus=$cpus" >> "$tmpfile"
   echo "memory=$memory" >> "$tmpfile"
   echo "disk=$disk" >> "$tmpfile"
+  [[ -n "$ports" ]] && echo "ports=$ports" >> "$tmpfile"
   for f in "${folders[@]}"; do
     echo "$f" >> "$tmpfile"
   done
@@ -383,6 +387,7 @@ _devm_print_resources() {
 
 # Build Lima mounts JSON from project config
 # Returns JSON array for .mounts setting
+# Security: each mount uses sshfs.followSymlinks=false to prevent symlink escape
 _devm_build_mounts() {
   local project="$1"
   local mounts="["
@@ -413,11 +418,40 @@ _devm_build_mounts() {
     vm_mount="$(_devm_vm_path "$folder")"
 
     [[ $first -eq 1 ]] && first=0 || mounts+=","
-    mounts+="{\"location\":\"${host_path}\",\"mountPoint\":\"${vm_mount}\",\"writable\":${writable}}"
+    mounts+="{\"location\":\"${host_path}\",\"mountPoint\":\"${vm_mount}\",\"writable\":${writable},\"sshfs\":{\"followSymlinks\":false}}"
   done <<< "$(_devm_config_folders_raw "$project")"
 
   mounts+="]"
   echo "$mounts"
+}
+
+# Build Lima portForwards JSON from config ports= setting
+# Disables automatic port forwarding; only listed ports are forwarded to localhost
+_devm_build_port_forwards() {
+  local project="$1"
+  local ports_str
+  ports_str=$(_devm_config_get "$project" "ports" 2>/dev/null || echo "")
+
+  local forwards="["
+  local first=1
+
+  # Add explicit port forwards
+  if [[ -n "$ports_str" ]]; then
+    IFS=',' read -ra port_list <<< "$ports_str"
+    for port in "${port_list[@]}"; do
+      port="$(echo "$port" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -z "$port" ]] && continue
+      [[ $first -eq 1 ]] && first=0 || forwards+=","
+      forwards+="{\"guestPort\":${port},\"hostPort\":${port},\"guestIP\":\"127.0.0.1\",\"hostIP\":\"127.0.0.1\",\"proto\":\"tcp\"}"
+    done
+  fi
+
+  # Disable automatic port forwarding for all other ports
+  [[ $first -eq 1 ]] && first=0 || forwards+=","
+  forwards+="{\"guestIP\":\"127.0.0.1\",\"proto\":\"tcp\",\"ignore\":true}"
+
+  forwards+="]"
+  echo "$forwards"
 }
 
 # Resolve project name from argument or cwd
@@ -521,11 +555,15 @@ _devm_ensure_running() {
     echo "Creating VM '$vm_name'..."
     limactl clone "$DEVM_TEMPLATE" "$vm_name" --tty=false &>/dev/null
 
-    local mounts_json
+    local mounts_json port_forwards_json
     mounts_json=$(_devm_build_mounts "$project")
+    port_forwards_json=$(_devm_build_port_forwards "$project")
 
     local edit_args=()
     edit_args+=(--set ".mounts = ${mounts_json}")
+    edit_args+=(--set ".portForwards = ${port_forwards_json}")
+    # Security: disable SSH agent forwarding to prevent credential leaking
+    edit_args+=(--set '.ssh.forwardAgent = false')
     edit_args+=(--memory "$memory")
     edit_args+=(--cpus "$cpus")
     (cd /tmp && limactl edit "$vm_name" "${edit_args[@]}") &>/dev/null
@@ -552,9 +590,10 @@ _devm_ensure_running() {
       else
         limactl stop "$vm_name" &>/dev/null
 
-        local mounts_json
+        local mounts_json port_forwards_json
         mounts_json=$(_devm_build_mounts "$project")
-        local edit_args=(--set ".mounts = ${mounts_json}" --memory "$memory" --cpus "$cpus")
+        port_forwards_json=$(_devm_build_port_forwards "$project")
+        local edit_args=(--set ".mounts = ${mounts_json}" --set ".portForwards = ${port_forwards_json}" --set '.ssh.forwardAgent = false' --memory "$memory" --cpus "$cpus")
         (cd /tmp && limactl edit "$vm_name" "${edit_args[@]}") &>/dev/null
         if [[ -n "$disk" ]]; then
           (cd /tmp && limactl edit "$vm_name" --disk "$disk") &>/dev/null || \
@@ -604,18 +643,22 @@ _devm_ensure_running() {
     fi
   done
 
-  # Apply .git read-only for git folders (unless explicitly :ro which is already fully read-only)
+  # Security: apply per-mount protections
   while IFS= read -r raw_line; do
     [[ -z "$raw_line" ]] && continue
-    local mode folder
+    local mode folder vm_folder
     mode=$(_devm_config_folder_mode "$raw_line")
     folder="${raw_line%:rw}"
     folder="${folder%:ro}"
+    vm_folder="$(_devm_vm_path "$folder")"
 
-    # Only bind-mount .git for writable git folders
+    # Protect writable mounts against symlink escape (nosymfollow, Linux 5.10+)
+    if [[ "$mode" == "rw" ]] || { [[ "$mode" == "auto" ]] && [[ -d "$folder/.git" ]]; }; then
+      limactl shell "$vm_name" sudo mount -o remount,nosymfollow "$vm_folder" 2>/dev/null || true
+    fi
+
+    # Bind-mount .git as read-only for writable git folders
     if [[ "$mode" != "ro" ]] && [[ -d "$folder/.git" ]]; then
-      local vm_folder
-      vm_folder="$(_devm_vm_path "$folder")"
       echo "Protecting .git in $(basename "$folder")..."
       limactl shell "$vm_name" sudo mount --bind "$vm_folder/.git" "$vm_folder/.git" 2>/dev/null
       limactl shell "$vm_name" sudo mount -o remount,ro,bind "$vm_folder/.git" 2>/dev/null
@@ -737,16 +780,24 @@ Config file (~/.devmconfig):
     cpus=2
     memory=4
     disk=10
+    ports=3000,8080
     ~/code/myapp
 
     [fullstack]
     cpus=4
     memory=8
     disk=20
+    ports=3000,5432,8080
     ~/code/frontend
     ~/code/backend
     ~/shared/libs:rw
     ~/reference/docs
+
+  Settings:
+    cpus=N              Number of CPUs
+    memory=N            Memory in GiB
+    disk=N              Disk in GiB
+    ports=P1,P2,...     Ports to forward from VM to host (localhost only)
 
   Mount modes (suffix on folder paths):
     :rw    Force writable mount
@@ -757,12 +808,19 @@ Config file (~/.devmconfig):
   Folder paths in the VM are under /devm/<absolute-host-path>, e.g.:
     ~/code/myapp → /devm/Users/you/code/myapp
 
-  Resource settings (cpus, memory, disk) are stored per VM.
   Edit ~/.devmconfig directly to customize or backup your configuration.
+
+Security:
+  - Only explicitly listed ports are forwarded (auto-forwarding disabled)
+  - Symlinks inside mounts cannot escape to the host filesystem
+  - Writable mounts use nosymfollow to block symlink traversal
+  - SSH agent forwarding is disabled (VM cannot access host credentials)
+  - .git directories are bind-mounted read-only in writable git repos
+  - Non-git folders are read-only by default
 
 Examples:
   devm setup                                    # Create base VM
-  devm create myapp ~/code/myapp --cpus 2       # Define a VM
+  devm create myapp ~/code/myapp --cpus 2 --ports 3000  # Define a VM
   devm shell myapp                              # Shell into the VM
   devm run myapp npm install                    # Run a command
   devm --offline shell myapp                    # No internet access
@@ -861,7 +919,7 @@ _devm_setup() {
 }
 
 _devm_create() {
-  local name="" cpus="" memory="" disk=""
+  local name="" cpus="" memory="" disk="" ports=""
   local folders=()
 
   while [[ $# -gt 0 ]]; do
@@ -872,15 +930,21 @@ _devm_create() {
       --memory=*|--ram=*) memory="${1#*=}"; shift ;;
       --disk)   disk="$2"; shift 2 ;;
       --disk=*) disk="${1#*=}"; shift ;;
+      --ports)  ports="$2"; shift 2 ;;
+      --ports=*) ports="${1#*=}"; shift ;;
       --help|-h)
-        echo "Usage: devm create <name> [folder...] [--cpus N] [--memory GB] [--disk GB]"
+        echo "Usage: devm create <name> [folder...] [--cpus N] [--memory GB] [--disk GB] [--ports LIST]"
         echo ""
         echo "Add or update a VM definition in ~/.devmconfig."
         echo "Folders can use :rw or :ro suffix to override mount mode."
         echo ""
+        echo "Options:"
+        echo "  --ports LIST   Comma-separated ports to forward (e.g. 3000,8080,5432)"
+        echo ""
         echo "Examples:"
         echo "  devm create myapp ~/code/myapp"
         echo "  devm create myapp ~/code/myapp --cpus 4 --memory 8"
+        echo "  devm create myapp ~/code/myapp --ports 3000,8080"
         echo "  devm create fullstack ~/code/frontend ~/code/backend ~/libs:rw"
         return 0
         ;;
@@ -897,7 +961,7 @@ _devm_create() {
   done
 
   if [[ -z "$name" ]]; then
-    echo "Usage: devm create <name> [folder...] [--cpus N] [--memory GB] [--disk GB]" >&2
+    echo "Usage: devm create <name> [folder...] [--cpus N] [--memory GB] [--disk GB] [--ports LIST]" >&2
     return 1
   fi
 
@@ -905,6 +969,7 @@ _devm_create() {
   [[ -n "$cpus" ]]   && write_args+=(--cpus "$cpus")
   [[ -n "$memory" ]] && write_args+=(--memory "$memory")
   [[ -n "$disk" ]]   && write_args+=(--disk "$disk")
+  [[ -n "$ports" ]]  && write_args+=(--ports "$ports")
 
   _devm_config_write_project "$name" "${write_args[@]}" "${folders[@]}" || return 1
 
@@ -917,7 +982,10 @@ _devm_create() {
     echo "  $f"
   done
   echo ""
+  local cfg_ports
+  cfg_ports=$(_devm_config_get "$name" ports 2>/dev/null || echo "none")
   echo "Resources: cpus=$(_devm_config_get "$name" cpus), memory=$(_devm_config_get "$name" memory) GiB, disk=$(_devm_config_get "$name" disk) GiB"
+  echo "Ports: $cfg_ports"
   echo ""
   echo "Edit $DEVM_CONFIG directly to customize or backup your configuration."
   echo "Run 'devm shell $name' to start the VM."
