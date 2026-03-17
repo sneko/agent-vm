@@ -15,6 +15,7 @@
 #   devm create <name> [dirs]  - Add a VM definition to ~/.devmconfig
 #   devm shell [name]          - Open a shell in the VM
 #   devm run [name] <cmd>      - Run a command in the VM
+#   devm provision [name]      - Update dev tools in a running VM
 #   devm stop [name]           - Stop the VM
 #   devm rm [name]             - Destroy the VM (keeps config)
 #   devm list                  - List all devm VMs
@@ -24,7 +25,10 @@
 
 # ─── Embedded setup script (runs inside the VM during "devm setup") ─────────
 
-read -r -d '' DEVM_SETUP_SCRIPT << 'SETUP_EOF'
+# ─── Base setup script (runs inside VM during "devm setup") ─────────────────
+# Installs OS-level packages that rarely change. Baked into the template.
+
+read -r -d '' DEVM_BASE_SETUP << 'BASE_SETUP_EOF'
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
@@ -79,28 +83,44 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubc
 sudo apt-get update
 sudo apt-get install -y gh
 
-# Install mise (manages .tool-versions, .nvmrc, .node-version, .python-version, etc.)
-echo "Installing mise..."
-curl https://mise.run | sh
-echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
-echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshenv
+# Create /devm mount root
+sudo mkdir -p /devm
 
-# Install Claude Code
-echo "Installing Claude Code..."
-curl -fsSL https://claude.ai/install.sh | bash
-echo 'export PATH=$HOME/.local/bin:$HOME/.claude/local/bin:$PATH' >> ~/.zshrc
+# Shell config (PS1, PATH placeholders)
 echo 'export PS1="devm:%1~%% "' >> ~/.zshrc
 
-# Install OpenCode
-echo "Installing OpenCode..."
-curl -fsSL https://opencode.ai/install | bash
-echo 'export PATH=$HOME/.opencode/bin:$PATH' >> ~/.zshrc
+echo "Base setup complete."
+BASE_SETUP_EOF
 
-# Add PATH to .zshenv so non-interactive shells also find the tools
-echo 'export PATH=$HOME/.local/bin:$HOME/.claude/local/bin:$HOME/.opencode/bin:$PATH' >> ~/.zshenv
+# ─── Provision script (runs on first start of each VM, idempotent) ──────────
+# Installs user-space tools (claude, mise, etc.). Can be re-run to update.
+
+read -r -d '' DEVM_PROVISION_SCRIPT << 'PROVISION_EOF'
+set -euo pipefail
+
+echo "Provisioning/updating dev tools..."
+
+# Install mise (manages .tool-versions, .nvmrc, .node-version, .python-version, etc.)
+echo "Installing/updating mise..."
+curl -fsSL https://mise.run | sh
+grep -q 'mise activate' ~/.zshrc 2>/dev/null || echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
+grep -q 'mise activate' ~/.zshenv 2>/dev/null || echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshenv
+
+# Install Claude Code
+echo "Installing/updating Claude Code..."
+curl -fsSL https://claude.ai/install.sh | bash
+grep -q '.claude/local/bin' ~/.zshrc 2>/dev/null || echo 'export PATH=$HOME/.local/bin:$HOME/.claude/local/bin:$PATH' >> ~/.zshrc
+
+# Install OpenCode
+echo "Installing/updating OpenCode..."
+curl -fsSL https://opencode.ai/install | bash
+grep -q '.opencode/bin' ~/.zshrc 2>/dev/null || echo 'export PATH=$HOME/.opencode/bin:$PATH' >> ~/.zshrc
+
+# Ensure PATH in .zshenv for non-interactive shells
+grep -q '.claude/local/bin' ~/.zshenv 2>/dev/null || echo 'export PATH=$HOME/.local/bin:$HOME/.claude/local/bin:$HOME/.opencode/bin:$PATH' >> ~/.zshenv
 
 # Install Codex CLI
-echo "Installing Codex CLI..."
+echo "Installing/updating Codex CLI..."
 sudo npm i -g @openai/codex
 
 # Configure Chrome DevTools MCP server for Claude
@@ -150,11 +170,8 @@ else
 JSON
 fi
 
-# Create /devm mount root
-sudo mkdir -p /devm
-
-echo "VM setup complete."
-SETUP_EOF
+echo "Provisioning complete."
+PROVISION_EOF
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -719,6 +736,9 @@ devm() {
       [[ -n "$rm_after" ]] && _devm_destroy_current
       return $rc
       ;;
+    provision)
+      _devm_provision "$@"
+      ;;
     stop)
       _devm_stop "$@"
       ;;
@@ -754,6 +774,7 @@ Commands:
   create <name> [dirs] [opts]     Add/update a VM definition in ~/.devmconfig
   shell [name]                    Open a shell in the VM
   run [name] <cmd> [args]         Run a command in the VM
+  provision [name]                Update dev tools in a running VM
   stop [name]                     Stop the VM
   rm [name]                       Destroy the VM (keeps config entry)
   destroy-all                     Destroy all devm VMs
@@ -895,9 +916,13 @@ _devm_setup() {
 
   limactl start "$DEVM_TEMPLATE" &>/dev/null || { echo "Error: Failed to start base VM." >&2; return 1; }
 
-  # Run the embedded setup script inside the VM
-  echo "Installing packages inside VM..."
-  echo "$DEVM_SETUP_SCRIPT" | limactl shell "$DEVM_TEMPLATE" bash -l || { echo "Error: Setup script failed." >&2; return 1; }
+  # Run the base setup script inside the VM (OS packages, docker, chromium)
+  echo "Installing system packages inside VM..."
+  echo "$DEVM_BASE_SETUP" | limactl shell "$DEVM_TEMPLATE" bash -l || { echo "Error: Base setup failed." >&2; return 1; }
+
+  # Run provisioning (user-space tools: claude, mise, opencode, codex)
+  echo "Provisioning dev tools..."
+  echo "$DEVM_PROVISION_SCRIPT" | limactl shell "$DEVM_TEMPLATE" bash -l || { echo "Error: Provisioning failed." >&2; return 1; }
 
   # Run user's custom setup script if it exists
   local user_setup="$DEVM_STATE_DIR/setup.sh"
@@ -1093,6 +1118,47 @@ _devm_resolve_project_arg() {
     return 0
   fi
   _devm_find_project_for_dir "$(pwd)"
+}
+
+_devm_provision() {
+  local project_arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --help|-h)
+        echo "Usage: devm provision [name]"
+        echo ""
+        echo "Re-run provisioning to install/update dev tools (claude, mise, opencode, codex)"
+        echo "inside an existing VM without rebuilding it."
+        return 0
+        ;;
+      *)
+        [[ -z "$project_arg" ]] && _devm_config_has_project "$1" && project_arg="$1"
+        shift
+        ;;
+    esac
+  done
+
+  local project
+  project=$(_devm_resolve_project_arg "$project_arg")
+  if [[ -z "$project" ]]; then
+    echo "Error: No VM name specified and none found for $(pwd)." >&2
+    return 1
+  fi
+
+  local vm_name
+  vm_name=$(_devm_vm_name "$project")
+
+  if ! _devm_running "$vm_name"; then
+    echo "Error: VM '$vm_name' is not running. Start it first with 'devm shell $project'." >&2
+    return 1
+  fi
+
+  echo "Updating dev tools in '$vm_name'..."
+  echo "$DEVM_PROVISION_SCRIPT" | limactl shell "$vm_name" bash -l || {
+    echo "Error: Provisioning failed." >&2
+    return 1
+  }
+  echo "Done. Tools updated in '$vm_name'."
 }
 
 _devm_stop() {
