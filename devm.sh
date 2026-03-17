@@ -63,6 +63,10 @@ cat >> ~/.zshrc << 'ZSHRC'
 alias ls='ls --color=auto'
 alias grep='grep --color=auto'
 export CLICOLOR=1
+
+# Inside the VM, agents run with full permissions (the VM is the sandbox)
+alias claude='claude --dangerously-skip-permissions'
+alias codex='codex --full-auto'
 ZSHRC
 
 # Install Docker from official repo
