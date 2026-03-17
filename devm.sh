@@ -234,7 +234,7 @@ _devm_config_get() {
   return 1
 }
 
-# List folder lines (raw, with :rw/:ro suffix) for a project
+# List mount lines (raw, with :rw/:ro suffix) for a project
 _devm_config_folders_raw() {
   local project="$1"
   local in_section=0
@@ -247,10 +247,8 @@ _devm_config_folders_raw() {
       [[ "${BASH_REMATCH[1]}" == "$project" ]] && in_section=1 || in_section=0
       continue
     fi
-    if [[ $in_section -eq 1 ]]; then
-      # Skip key=value settings
-      [[ "$line" =~ ^[a-z]+=.+$ ]] && continue
-      echo "$(_devm_resolve_path "$line")"
+    if [[ $in_section -eq 1 ]] && [[ "$line" =~ ^mount=(.+)$ ]]; then
+      echo "$(_devm_resolve_path "${BASH_REMATCH[1]}")"
     fi
   done < "$DEVM_CONFIG"
 }
@@ -315,6 +313,8 @@ _devm_config_write_project() {
   local name="$1"; shift
   local cpus="" memory="" disk="" ports=""
   local folders=()
+  local env_entries=()
+  local env_provided=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -322,6 +322,23 @@ _devm_config_write_project() {
       --memory) memory="$2"; shift 2 ;;
       --disk)   disk="$2"; shift 2 ;;
       --ports)  ports="$2"; shift 2 ;;
+      --env)
+        env_provided=1
+        # Parse comma-separated: VAR=value or VAR (forward from host)
+        IFS=',' read -ra items <<< "$2"
+        for item in "${items[@]}"; do
+          item="$(echo "$item" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          [[ -z "$item" ]] && continue
+          if [[ "$item" == *=* ]]; then
+            # VAR=value → hardcoded
+            env_entries+=("env.${item}")
+          else
+            # VAR → forward from host (no =)
+            env_entries+=("env.${item}")
+          fi
+        done
+        shift 2
+        ;;
       *)        folders+=("$1"); shift ;;
     esac
   done
@@ -337,6 +354,21 @@ _devm_config_write_project() {
   memory="${memory:-${old_memory:-2}}"
   disk="${disk:-${old_disk:-10}}"
   ports="${ports:-${old_ports:-}}"
+
+  # Preserve existing env entries if --env was not provided
+  if [[ $env_provided -eq 0 ]] && [[ -f "$DEVM_CONFIG" ]]; then
+    local in_section=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+        [[ "${BASH_REMATCH[1]}" == "$name" ]] && in_section=1 || in_section=0
+        continue
+      fi
+      if [[ $in_section -eq 1 ]] && [[ "$line" =~ ^env\.[a-zA-Z_] ]]; then
+        env_entries+=("$line")
+      fi
+    done < "$DEVM_CONFIG"
+  fi
 
   # Get existing folders if no new folders provided
   if [[ ${#folders[@]} -eq 0 ]]; then
@@ -387,8 +419,11 @@ _devm_config_write_project() {
   echo "memory=$memory" >> "$tmpfile"
   echo "disk=$disk" >> "$tmpfile"
   [[ -n "$ports" ]] && echo "ports=$ports" >> "$tmpfile"
+  for e in "${env_entries[@]}"; do
+    echo "$e" >> "$tmpfile"
+  done
   for f in "${folders[@]}"; do
-    echo "$f" >> "$tmpfile"
+    echo "mount=$f" >> "$tmpfile"
   done
 
   mv "$tmpfile" "$DEVM_CONFIG"
@@ -488,6 +523,72 @@ _devm_build_port_forwards() {
 
   forwards+="]"
   echo "$forwards"
+}
+
+# Parse env vars from config for a project
+# Config format:
+#   env.VAR_NAME          → forward from host environment
+#   env.VAR_NAME=         → set to empty string
+#   env.VAR_NAME=value    → hardcoded value
+# Outputs export commands
+_devm_build_env_exports() {
+  local project="$1"
+  local in_section=0
+  [[ -f "$DEVM_CONFIG" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      [[ "${BASH_REMATCH[1]}" == "$project" ]] && in_section=1 || in_section=0
+      continue
+    fi
+    if [[ $in_section -eq 1 ]] && [[ "$line" =~ ^env\.([a-zA-Z_][a-zA-Z0-9_]*)(=(.*))?$ ]]; then
+      local var_name="${BASH_REMATCH[1]}"
+      local has_equals="${BASH_REMATCH[2]}"
+      local var_val="${BASH_REMATCH[3]}"
+
+      if [[ -z "$has_equals" ]]; then
+        # env.VAR (no =) → forward from host
+        local host_val="${!var_name:-}"
+        if [[ -n "$host_val" ]]; then
+          host_val="${host_val//\'/\'\\\'\'}"
+          echo "export ${var_name}='${host_val}'"
+        else
+          echo "# Warning: ${var_name} not set on host" >&2
+        fi
+      elif [[ -n "$var_val" ]]; then
+        # env.VAR=value → hardcoded
+        var_val="${var_val//\'/\'\\\'\'}"
+        echo "export ${var_name}='${var_val}'"
+      else
+        # env.VAR= → empty string
+        echo "export ${var_name}=''"
+      fi
+    fi
+  done < "$DEVM_CONFIG"
+}
+
+# Run a command inside the VM with env vars from config injected
+# Usage: _devm_shell_exec <vm_name> <project> <workdir> [cmd...]
+_devm_shell_exec() {
+  local vm_name="$1" project="$2" workdir="$3"
+  shift 3
+
+  local env_exports
+  env_exports=$(_devm_build_env_exports "$project")
+
+  if [[ -n "$env_exports" && $# -gt 0 ]]; then
+    # Wrap command with env exports
+    limactl shell --workdir "$workdir" "$vm_name" bash -c "${env_exports}; exec \"\$@\"" -- "$@"
+  elif [[ -n "$env_exports" ]]; then
+    # Interactive shell: write env to a temp file, source it then exec zsh
+    limactl shell --workdir "$workdir" "$vm_name" bash -c "${env_exports}; exec zsh -l"
+  elif [[ $# -gt 0 ]]; then
+    limactl shell --workdir "$workdir" "$vm_name" "$@"
+  else
+    limactl shell --workdir "$workdir" "$vm_name" zsh -l
+  fi
 }
 
 # Resolve project name from argument or cwd
@@ -606,7 +707,8 @@ _devm_ensure_running() {
     local edit_args=()
     edit_args+=(--set ".mounts = ${mounts_json}")
     edit_args+=(--set ".portForwards = ${port_forwards_json}")
-    # Security: disable SSH agent forwarding to prevent credential leaking
+    # Security: block host env forwarding and SSH agent to prevent data leaking
+    edit_args+=(--set '.propagateCurrentEnv = false')
     edit_args+=(--set '.ssh.forwardAgent = false')
     edit_args+=(--memory "$memory")
     edit_args+=(--cpus "$cpus")
@@ -637,7 +739,7 @@ _devm_ensure_running() {
         local mounts_json port_forwards_json
         mounts_json=$(_devm_build_mounts "$project")
         port_forwards_json=$(_devm_build_port_forwards "$project")
-        local edit_args=(--set ".mounts = ${mounts_json}" --set ".portForwards = ${port_forwards_json}" --set '.ssh.forwardAgent = false' --memory "$memory" --cpus "$cpus")
+        local edit_args=(--set ".mounts = ${mounts_json}" --set ".portForwards = ${port_forwards_json}" --set '.propagateCurrentEnv = false' --set '.ssh.forwardAgent = false' --memory "$memory" --cpus "$cpus")
         (cd /tmp && limactl edit "$vm_name" "${edit_args[@]}") &>/dev/null
         if [[ -n "$disk" ]]; then
           (cd /tmp && limactl edit "$vm_name" --disk "$disk") &>/dev/null || \
@@ -832,17 +934,20 @@ Config file (~/.devmconfig):
     memory=4
     disk=10
     ports=3000,8080
-    ~/code/myapp
+    env.ANTHROPIC_API_KEY
+    env.DB_URL=postgres://localhost/mydb
+    mount=~/code/myapp
 
     [fullstack]
     cpus=4
     memory=8
     disk=20
     ports=3000,5432,8080
-    ~/code/frontend
-    ~/code/backend
-    ~/shared/libs:rw
-    ~/reference/docs
+    env.OPENAI_API_KEY
+    mount=~/code/frontend
+    mount=~/code/backend
+    mount=~/shared/libs:rw
+    mount=~/reference/docs
 
   Settings:
     cpus=N              Number of CPUs
@@ -850,18 +955,23 @@ Config file (~/.devmconfig):
     disk=N              Disk in GiB
     ports=P1,P2,...     Ports to forward from VM to host (localhost only)
 
-  Mount modes (suffix on folder paths):
-    :rw    Force writable mount
-    :ro    Force read-only mount
-    (none) Smart default: git repos are writable (with .git read-only),
-           non-git folders are read-only
+  Environment variables (env.*):
+    env.VAR             Forward VAR from host environment
+    env.VAR=value       Set VAR to a hardcoded value
+    env.VAR=            Set VAR to empty string
 
-  Folder paths in the VM are under /devm/<absolute-host-path>, e.g.:
+  Mounts (mount=):
+    mount=/path         Smart default (git repos writable, others read-only)
+    mount=/path:rw      Force writable
+    mount=/path:ro      Force read-only
+
+  Paths in the VM are under /devm/<absolute-host-path>, e.g.:
     ~/code/myapp → /devm/Users/you/code/myapp
 
   Edit ~/.devmconfig directly to customize or backup your configuration.
 
 Security:
+  - Host environment is NOT forwarded (use env= to whitelist specific vars)
   - Only explicitly listed ports are forwarded (auto-forwarding disabled)
   - Symlinks inside mounts cannot escape to the host filesystem
   - Writable mounts use nosymfollow to block symlink traversal
@@ -974,7 +1084,7 @@ _devm_setup() {
 }
 
 _devm_create() {
-  local name="" cpus="" memory="" disk="" ports=""
+  local name="" cpus="" memory="" disk="" ports="" env_vars=""
   local folders=()
 
   while [[ $# -gt 0 ]]; do
@@ -987,19 +1097,26 @@ _devm_create() {
       --disk=*) disk="${1#*=}"; shift ;;
       --ports)  ports="$2"; shift 2 ;;
       --ports=*) ports="${1#*=}"; shift ;;
+      --env)    env_vars="$2"; shift 2 ;;
+      --env=*)  env_vars="${1#*=}"; shift ;;
       --help|-h)
-        echo "Usage: devm create <name> [folder...] [--cpus N] [--memory GB] [--disk GB] [--ports LIST]"
+        echo "Usage: devm create <name> [folder...] [options]"
         echo ""
         echo "Add or update a VM definition in ~/.devmconfig."
         echo "Folders can use :rw or :ro suffix to override mount mode."
         echo ""
         echo "Options:"
-        echo "  --ports LIST   Comma-separated ports to forward (e.g. 3000,8080,5432)"
+        echo "  --cpus N       Number of CPUs (default: 1)"
+        echo "  --memory GB    Memory in GiB (default: 2)"
+        echo "  --disk GB      Disk in GiB (default: 10)"
+        echo "  --ports LIST   Comma-separated ports to forward (e.g. 3000,8080)"
+        echo "  --env LIST     Comma-separated host env vars to pass to the VM"
+        echo "                 (e.g. ANTHROPIC_API_KEY,OPENAI_API_KEY)"
         echo ""
         echo "Examples:"
         echo "  devm create myapp ~/code/myapp"
         echo "  devm create myapp ~/code/myapp --cpus 4 --memory 8"
-        echo "  devm create myapp ~/code/myapp --ports 3000,8080"
+        echo "  devm create myapp ~/code/myapp --ports 3000 --env ANTHROPIC_API_KEY"
         echo "  devm create fullstack ~/code/frontend ~/code/backend ~/libs:rw"
         return 0
         ;;
@@ -1016,15 +1133,18 @@ _devm_create() {
   done
 
   if [[ -z "$name" ]]; then
-    echo "Usage: devm create <name> [folder...] [--cpus N] [--memory GB] [--disk GB] [--ports LIST]" >&2
+    echo "Usage: devm create <name> [folder...] [options]" >&2
+    echo "" >&2
+    echo "Run 'devm create --help' for full usage." >&2
     return 1
   fi
 
   local write_args=()
-  [[ -n "$cpus" ]]   && write_args+=(--cpus "$cpus")
-  [[ -n "$memory" ]] && write_args+=(--memory "$memory")
-  [[ -n "$disk" ]]   && write_args+=(--disk "$disk")
-  [[ -n "$ports" ]]  && write_args+=(--ports "$ports")
+  [[ -n "$cpus" ]]     && write_args+=(--cpus "$cpus")
+  [[ -n "$memory" ]]   && write_args+=(--memory "$memory")
+  [[ -n "$disk" ]]     && write_args+=(--disk "$disk")
+  [[ -n "$ports" ]]    && write_args+=(--ports "$ports")
+  [[ -n "$env_vars" ]] && write_args+=(--env "$env_vars")
 
   _devm_config_write_project "$name" "${write_args[@]}" "${folders[@]}" || return 1
 
@@ -1041,6 +1161,34 @@ _devm_create() {
   cfg_ports=$(_devm_config_get "$name" ports 2>/dev/null || echo "none")
   echo "Resources: cpus=$(_devm_config_get "$name" cpus), memory=$(_devm_config_get "$name" memory) GiB, disk=$(_devm_config_get "$name" disk) GiB"
   echo "Ports: $cfg_ports"
+
+  # Show env vars from the section we just wrote
+  local env_lines=""
+  local in_section=0
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      [[ "${BASH_REMATCH[1]}" == "$name" ]] && in_section=1 || in_section=0
+      continue
+    fi
+    [[ $in_section -eq 1 ]] && [[ "$line" =~ ^env\.[a-zA-Z_] ]] && env_lines+="$line"$'\n'
+  done < "$DEVM_CONFIG"
+  if [[ -n "$env_lines" ]]; then
+    echo "Env vars:"
+    echo -n "$env_lines" | while IFS= read -r el; do
+      local var_part="${el#env.}"
+      if [[ "$var_part" == *=* ]]; then
+        local vn="${var_part%%=*}"
+        local vv="${var_part#*=}"
+        if [[ -n "$vv" ]]; then
+          echo "  $vn = (hardcoded)"
+        else
+          echo "  $vn = (empty)"
+        fi
+      else
+        echo "  $var_part = (from host)"
+      fi
+    done
+  fi
   echo ""
   echo "Edit $DEVM_CONFIG directly to customize or backup your configuration."
   echo "Run 'devm shell $name' to start the VM."
@@ -1083,7 +1231,7 @@ _devm_shell() {
 
   # Track current project for --rm cleanup
   DEVM_LAST_PROJECT="$DEVM_PROJECT"
-  limactl shell --workdir "$DEVM_WORKDIR" "$vm_name" zsh -l
+  _devm_shell_exec "$vm_name" "$DEVM_PROJECT" "$DEVM_WORKDIR"
 }
 
 _devm_run() {
@@ -1139,7 +1287,7 @@ _devm_run() {
   _devm_ensure_running "$vm_name" "$DEVM_PROJECT" "${vm_opts[@]}" || return 1
 
   DEVM_LAST_PROJECT="$DEVM_PROJECT"
-  limactl shell --workdir "$DEVM_WORKDIR" "$vm_name" "${cmd_args[@]}"
+  _devm_shell_exec "$vm_name" "$DEVM_PROJECT" "$DEVM_WORKDIR" "${cmd_args[@]}"
 }
 
 _devm_resolve_project_arg() {
