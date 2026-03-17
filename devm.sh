@@ -192,10 +192,19 @@ _devm_resolve_path() {
   fi
   # Expand ~
   p="${p/#\~/$HOME}"
-  # Resolve relative paths
+  # Resolve relative paths to absolute
   if [[ "$p" != /* ]]; then
-    p="$(cd "$(pwd)" && realpath -m "$p" 2>/dev/null || echo "$(pwd)/$p")"
+    if [[ -d "$p" ]]; then
+      p="$(cd "$p" && pwd)"
+    else
+      # Path doesn't exist yet — resolve as best we can
+      p="$(cd "$(dirname "$p")" 2>/dev/null && echo "$(pwd)/$(basename "$p")" || echo "$(pwd)/$p")"
+    fi
   fi
+  # Remove any trailing slashes or dots
+  p="${p%/}"
+  p="${p%.}"
+  p="${p%/}"
   echo "${p}${suffix}"
 }
 
@@ -338,6 +347,16 @@ _devm_config_write_project() {
 
   if [[ ${#folders[@]} -eq 0 ]]; then
     echo "Error: No folders specified for '$name'." >&2
+    echo "" >&2
+    echo "Usage: devm create <name> <folder> [folder...] [options]" >&2
+    echo "" >&2
+    echo "You must specify at least one folder to mount in the VM." >&2
+    echo "The first folder is used as the default working directory." >&2
+    echo "" >&2
+    echo "Examples:" >&2
+    echo "  devm create $name ~/code/$name" >&2
+    echo "  devm create $name ~/code/frontend ~/code/backend --cpus 4" >&2
+    echo "  devm create $name ~/code/myrepo ~/shared/libs:rw" >&2
     return 1
   fi
 
@@ -526,7 +545,12 @@ _devm_ensure_running() {
 
   # Check base template
   if ! limactl list -q 2>/dev/null | grep -q "^${DEVM_TEMPLATE}$"; then
-    echo "Error: Base VM not found. Run 'devm setup' first." >&2
+    echo "Error: Base VM template not found." >&2
+    echo "" >&2
+    echo "Run the one-time setup first:" >&2
+    echo "  devm setup" >&2
+    echo "" >&2
+    echo "This creates a base VM with system packages, Docker, Chromium, and dev tools." >&2
     return 1
   fi
 
@@ -556,7 +580,10 @@ _devm_ensure_running() {
   done <<< "$(_devm_config_folders "$project")"
 
   if [[ ${#folders[@]} -eq 0 ]]; then
-    echo "Error: No folders configured for '$project' in $DEVM_CONFIG" >&2
+    echo "Error: No folders configured for '$project' in $DEVM_CONFIG." >&2
+    echo "" >&2
+    echo "Add folders to the [$project] section in $DEVM_CONFIG, or re-create:" >&2
+    echo "  devm create $project ~/path/to/folder" >&2
     return 1
   fi
 
@@ -758,8 +785,11 @@ devm() {
       _devm_help
       ;;
     *)
-      echo "Unknown command: $cmd" >&2
-      echo "Run 'devm help' for usage." >&2
+      echo "Error: Unknown command '$cmd'." >&2
+      echo "" >&2
+      echo "Available commands: setup, create, shell, run, provision, stop, rm, destroy-all, list, status" >&2
+      echo "" >&2
+      echo "Run 'devm help' for full usage." >&2
       return 1
       ;;
   esac
@@ -1038,11 +1068,7 @@ _devm_shell() {
 
   DEVM_PROJECT="" DEVM_WORKDIR=""
   if ! _devm_resolve_project "$project_arg"; then
-    if [[ -n "$project_arg" ]]; then
-      echo "Error: Unknown VM name '$project_arg'. Check $DEVM_CONFIG" >&2
-    else
-      echo "Error: No VM found for $(pwd). Add one with 'devm create' or edit $DEVM_CONFIG" >&2
-    fi
+    _devm_error_no_vm "shell" "$project_arg"
     return 1
   fi
 
@@ -1088,17 +1114,22 @@ _devm_run() {
   done
 
   if [[ ${#cmd_args[@]} -eq 0 ]]; then
+    echo "Error: No command specified." >&2
+    echo "" >&2
     echo "Usage: devm run [name] <command> [args]" >&2
+    echo "" >&2
+    echo "Run any command inside the VM. Examples:" >&2
+    echo "  devm run myapp npm install" >&2
+    echo "  devm run myapp claude --dangerously-skip-permissions" >&2
+    echo "  devm run myapp make build" >&2
+    echo "" >&2
+    echo "For an interactive shell, use: devm shell [name]" >&2
     return 1
   fi
 
   DEVM_PROJECT="" DEVM_WORKDIR=""
   if ! _devm_resolve_project "$project_arg"; then
-    if [[ -n "$project_arg" ]]; then
-      echo "Error: Unknown VM name '$project_arg'. Check $DEVM_CONFIG" >&2
-    else
-      echo "Error: No VM found for $(pwd). Add one with 'devm create' or edit $DEVM_CONFIG" >&2
-    fi
+    _devm_error_no_vm "run" "$project_arg"
     return 1
   fi
 
@@ -1120,6 +1151,34 @@ _devm_resolve_project_arg() {
   _devm_find_project_for_dir "$(pwd)"
 }
 
+# Print a helpful error when no VM can be resolved
+# Usage: _devm_error_no_vm <command> [attempted_name]
+_devm_error_no_vm() {
+  local cmd="$1"
+  local attempted="${2:-}"
+  if [[ -n "$attempted" ]]; then
+    echo "Error: Unknown VM name '$attempted'." >&2
+  else
+    echo "Error: Cannot determine which VM to use." >&2
+    echo "  Current directory ($(pwd)) does not match any VM in $DEVM_CONFIG." >&2
+  fi
+  echo "" >&2
+  echo "Either specify a VM name or cd into a configured folder:" >&2
+  echo "  devm $cmd <name>" >&2
+  echo "" >&2
+  local projects
+  projects=$(_devm_config_projects 2>/dev/null)
+  if [[ -n "$projects" ]]; then
+    echo "Available VMs:" >&2
+    echo "$projects" | while read -r p; do
+      echo "  - $p" >&2
+    done
+  else
+    echo "No VMs configured yet. Create one first:" >&2
+    echo "  devm create <name> <folder>" >&2
+  fi
+}
+
 _devm_provision() {
   local project_arg=""
   while [[ $# -gt 0 ]]; do
@@ -1127,8 +1186,11 @@ _devm_provision() {
       --help|-h)
         echo "Usage: devm provision [name]"
         echo ""
-        echo "Re-run provisioning to install/update dev tools (claude, mise, opencode, codex)"
-        echo "inside an existing VM without rebuilding it."
+        echo "Install/update dev tools (claude, mise, opencode, codex) inside a running VM."
+        echo ""
+        echo "Examples:"
+        echo "  devm provision myapp"
+        echo "  devm provision           # auto-detect from current directory"
         return 0
         ;;
       *)
@@ -1141,7 +1203,7 @@ _devm_provision() {
   local project
   project=$(_devm_resolve_project_arg "$project_arg")
   if [[ -z "$project" ]]; then
-    echo "Error: No VM name specified and none found for $(pwd)." >&2
+    _devm_error_no_vm "provision" "$project_arg"
     return 1
   fi
 
@@ -1149,7 +1211,11 @@ _devm_provision() {
   vm_name=$(_devm_vm_name "$project")
 
   if ! _devm_running "$vm_name"; then
-    echo "Error: VM '$vm_name' is not running. Start it first with 'devm shell $project'." >&2
+    echo "Error: VM '$vm_name' is not running." >&2
+    echo "" >&2
+    echo "Start it first, then provision:" >&2
+    echo "  devm shell $project" >&2
+    echo "  devm provision $project" >&2
     return 1
   fi
 
@@ -1165,7 +1231,7 @@ _devm_stop() {
   local project
   project=$(_devm_resolve_project_arg "$1")
   if [[ -z "$project" ]]; then
-    echo "Error: No VM name specified and none found for $(pwd)." >&2
+    _devm_error_no_vm "stop" "$1"
     return 1
   fi
 
@@ -1173,7 +1239,9 @@ _devm_stop() {
   vm_name=$(_devm_vm_name "$project")
 
   if ! _devm_exists "$vm_name"; then
-    echo "No VM found for '$project'." >&2
+    echo "Error: No VM exists for '$project'." >&2
+    echo "" >&2
+    echo "The VM may not have been started yet. Use 'devm shell $project' to create and start it." >&2
     return 1
   fi
 
@@ -1186,7 +1254,7 @@ _devm_destroy() {
   local project
   project=$(_devm_resolve_project_arg "$1")
   if [[ -z "$project" ]]; then
-    echo "Error: No VM name specified and none found for $(pwd)." >&2
+    _devm_error_no_vm "rm" "$1"
     return 1
   fi
 
@@ -1194,7 +1262,9 @@ _devm_destroy() {
   vm_name=$(_devm_vm_name "$project")
 
   if ! _devm_exists "$vm_name"; then
-    echo "No VM found for '$project'." >&2
+    echo "Error: No VM exists for '$project'." >&2
+    echo "" >&2
+    echo "Nothing to destroy. The config entry in $DEVM_CONFIG is unchanged." >&2
     return 1
   fi
 
