@@ -46,10 +46,24 @@ sudo apt-get install -y \
   ripgrep fd-find htop \
   unzip zip \
   ca-certificates \
-  iptables
+  iptables \
+  zsh-syntax-highlighting \
+  zsh-autosuggestions
 
 # Set zsh as default shell
 sudo chsh -s /usr/bin/zsh "$(whoami)"
+
+# Enable zsh plugins and colors
+cat >> ~/.zshrc << 'ZSHRC'
+# Syntax highlighting and autosuggestions
+[ -f /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ] && source /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+[ -f /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh ] && source /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh
+
+# Colors
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+export CLICOLOR=1
+ZSHRC
 
 # Install Docker from official repo
 echo "Installing Docker..."
@@ -87,7 +101,7 @@ sudo apt-get install -y gh
 sudo mkdir -p /devm
 
 # Shell config (PS1, PATH placeholders)
-echo 'export PS1="devm:%1~%% "' >> ~/.zshrc
+echo 'export PS1="%F{cyan}devm%f:%F{yellow}%1~%f%% "' >> ~/.zshrc
 
 echo "Base setup complete."
 BASE_SETUP_EOF
