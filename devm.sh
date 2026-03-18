@@ -903,14 +903,14 @@ _devm_ensure_running() {
 
     # Protect writable mounts against symlink escape (nosymfollow, Linux 5.10+)
     if [[ "$mode" == "rw" ]] || { [[ "$mode" == "auto" ]] && [[ -d "$folder/.git" ]]; }; then
-      limactl shell --workdir /tmp "$vm_name" sudo mount -o remount,nosymfollow "$vm_folder" 2>/dev/null || true
+      limactl shell --workdir /tmp "$vm_name" sudo mount -o remount,nosymfollow "$vm_folder" < /dev/null 2>/dev/null || true
     fi
 
     # Bind-mount .git as read-only for writable git folders
     if [[ "$mode" != "ro" ]] && [[ -d "$folder/.git" ]]; then
       echo "Protecting .git in $(basename "$folder")..."
-      limactl shell --workdir /tmp "$vm_name" sudo mount --bind "$vm_folder/.git" "$vm_folder/.git" 2>/dev/null
-      limactl shell --workdir /tmp "$vm_name" sudo mount -o remount,ro,bind "$vm_folder/.git" 2>/dev/null
+      limactl shell --workdir /tmp "$vm_name" sudo mount --bind "$vm_folder/.git" "$vm_folder/.git" < /dev/null 2>/dev/null
+      limactl shell --workdir /tmp "$vm_name" sudo mount -o remount,ro,bind "$vm_folder/.git" < /dev/null 2>/dev/null
     fi
 
     # Hide host dependency dirs (wrong architecture) with persistent VM-local overlays
@@ -920,7 +920,7 @@ _devm_ensure_running() {
       for dep in "${dep_dirs[@]}"; do
         if [[ -d "$folder/$dep" ]]; then
           echo "  Overlaying $dep in $(basename "$folder")..."
-          limactl shell --workdir /tmp "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${dep}\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${dep}\" \"${vm_folder}/${dep}\"" 2>/dev/null
+          limactl shell --workdir /tmp "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${dep}\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${dep}\" \"${vm_folder}/${dep}\"" < /dev/null 2>/dev/null
         fi
       done
       # Also handle nested node_modules in monorepos (one level deep)
@@ -930,7 +930,7 @@ _devm_ensure_running() {
           subname=$(basename "$subdir")
           if [[ -d "$subdir/node_modules" && "$subname" != "node_modules" ]]; then
             echo "  Overlaying node_modules in $(basename "$folder")/$subname..."
-            limactl shell --workdir /tmp "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" \"${vm_folder}/${subname}/node_modules\"" 2>/dev/null
+            limactl shell --workdir /tmp "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" \"${vm_folder}/${subname}/node_modules\"" < /dev/null 2>/dev/null
           fi
         done
       fi
