@@ -273,8 +273,6 @@ _devm_config_folders_raw() {
       check_path="${check_path%:ro}"
       if [[ -d "$check_path" ]]; then
         echo "$resolved"
-      else
-        echo "Warning: Skipping mount '$check_path' (not a directory)" >&2
       fi
     fi
   done < "$DEVM_CONFIG"
@@ -738,11 +736,31 @@ _devm_ensure_running() {
   memory="${memory:-$cfg_memory}"
   disk="${disk:-$cfg_disk}"
 
-  # Get folders
+  # Get folders and warn about skipped mounts (once)
   local folders=()
   while IFS= read -r f; do
     [[ -n "$f" ]] && folders+=("$f")
   done <<< "$(_devm_config_folders "$project")"
+
+  # Check for non-directory mount entries in raw config
+  local in_section=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      [[ "${BASH_REMATCH[1]}" == "$project" ]] && in_section=1 || in_section=0
+      continue
+    fi
+    if [[ $in_section -eq 1 ]] && [[ "$line" =~ ^mount=(.+)$ ]]; then
+      local raw_path="${BASH_REMATCH[1]}"
+      raw_path="${raw_path%:rw}"; raw_path="${raw_path%:ro}"
+      raw_path="${raw_path/#\~/$HOME}"
+      [[ "$raw_path" != /* ]] && raw_path="$(cd "$raw_path" 2>/dev/null && pwd || echo "$raw_path")"
+      if [[ ! -d "$raw_path" ]]; then
+        echo "Warning: Skipping mount '$raw_path' (not a directory)" >&2
+      fi
+    fi
+  done < "$DEVM_CONFIG"
 
   if [[ ${#folders[@]} -eq 0 ]]; then
     echo "Error: No folders configured for '$project' in $DEVM_CONFIG." >&2
