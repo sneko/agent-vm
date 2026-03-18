@@ -619,16 +619,20 @@ _devm_shell_exec() {
   local env_exports
   env_exports=$(_devm_build_env_exports "$project")
 
-  if [[ -n "$env_exports" && $# -gt 0 ]]; then
-    # Wrap command with env exports
-    limactl shell --workdir "$workdir" "$vm_name" bash -c "${env_exports}; exec \"\$@\"" -- "$@"
-  elif [[ -n "$env_exports" ]]; then
-    # Interactive shell: write env to a temp file, source it then exec zsh
-    limactl shell --workdir "$workdir" "$vm_name" bash -c "${env_exports}; exec zsh -l"
-  elif [[ $# -gt 0 ]]; then
-    limactl shell --workdir "$workdir" "$vm_name" "$@"
+  if [[ $# -gt 0 ]]; then
+    # Non-interactive command: run directly via bash (skip zsh startup)
+    if [[ -n "$env_exports" ]]; then
+      limactl shell --workdir "$workdir" "$vm_name" bash -c "${env_exports}; exec \"\$@\"" -- "$@"
+    else
+      limactl shell --workdir "$workdir" "$vm_name" bash -c 'exec "$@"' -- "$@"
+    fi
   else
-    limactl shell --workdir "$workdir" "$vm_name" zsh -l
+    # Interactive shell: use zsh with full profile
+    if [[ -n "$env_exports" ]]; then
+      limactl shell --workdir "$workdir" "$vm_name" bash -c "${env_exports}; exec zsh -l"
+    else
+      limactl shell --workdir "$workdir" "$vm_name" zsh -l
+    fi
   fi
 }
 
@@ -882,14 +886,14 @@ _devm_ensure_running() {
 
     # Protect writable mounts against symlink escape (nosymfollow, Linux 5.10+)
     if [[ "$mode" == "rw" ]] || { [[ "$mode" == "auto" ]] && [[ -d "$folder/.git" ]]; }; then
-      limactl shell "$vm_name" sudo mount -o remount,nosymfollow "$vm_folder" 2>/dev/null || true
+      limactl shell --workdir /tmp "$vm_name" sudo mount -o remount,nosymfollow "$vm_folder" 2>/dev/null || true
     fi
 
     # Bind-mount .git as read-only for writable git folders
     if [[ "$mode" != "ro" ]] && [[ -d "$folder/.git" ]]; then
       echo "Protecting .git in $(basename "$folder")..."
-      limactl shell "$vm_name" sudo mount --bind "$vm_folder/.git" "$vm_folder/.git" 2>/dev/null
-      limactl shell "$vm_name" sudo mount -o remount,ro,bind "$vm_folder/.git" 2>/dev/null
+      limactl shell --workdir /tmp "$vm_name" sudo mount --bind "$vm_folder/.git" "$vm_folder/.git" 2>/dev/null
+      limactl shell --workdir /tmp "$vm_name" sudo mount -o remount,ro,bind "$vm_folder/.git" 2>/dev/null
     fi
 
     # Hide host dependency dirs (wrong architecture) with persistent VM-local overlays
@@ -899,7 +903,7 @@ _devm_ensure_running() {
       for dep in "${dep_dirs[@]}"; do
         if [[ -d "$folder/$dep" ]]; then
           echo "  Overlaying $dep in $(basename "$folder")..."
-          limactl shell "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${dep}\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${dep}\" \"${vm_folder}/${dep}\"" 2>/dev/null
+          limactl shell --workdir /tmp "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${dep}\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${dep}\" \"${vm_folder}/${dep}\"" 2>/dev/null
         fi
       done
       # Also handle nested node_modules in monorepos (one level deep)
@@ -909,7 +913,7 @@ _devm_ensure_running() {
           subname=$(basename "$subdir")
           if [[ -d "$subdir/node_modules" && "$subname" != "node_modules" ]]; then
             echo "  Overlaying node_modules in $(basename "$folder")/$subname..."
-            limactl shell "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" \"${vm_folder}/${subname}/node_modules\"" 2>/dev/null
+            limactl shell --workdir /tmp "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" \"${vm_folder}/${subname}/node_modules\"" 2>/dev/null
           fi
         done
       fi
@@ -921,12 +925,12 @@ _devm_ensure_running() {
   # Offline mode
   if [[ -n "$offline" ]]; then
     echo "Enabling offline mode..."
-    limactl shell "$vm_name" sudo iptables -F OUTPUT 2>/dev/null
-    limactl shell "$vm_name" sudo iptables -A OUTPUT -o lo -j ACCEPT
-    limactl shell "$vm_name" sudo iptables -A OUTPUT -d 10.0.0.0/8 -j ACCEPT
-    limactl shell "$vm_name" sudo iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT
-    limactl shell "$vm_name" sudo iptables -A OUTPUT -d 192.168.0.0/16 -j ACCEPT
-    limactl shell "$vm_name" sudo iptables -P OUTPUT DROP
+    limactl shell --workdir /tmp "$vm_name" sudo iptables -F OUTPUT 2>/dev/null
+    limactl shell --workdir /tmp "$vm_name" sudo iptables -A OUTPUT -o lo -j ACCEPT
+    limactl shell --workdir /tmp "$vm_name" sudo iptables -A OUTPUT -d 10.0.0.0/8 -j ACCEPT
+    limactl shell --workdir /tmp "$vm_name" sudo iptables -A OUTPUT -d 172.16.0.0/12 -j ACCEPT
+    limactl shell --workdir /tmp "$vm_name" sudo iptables -A OUTPUT -d 192.168.0.0/16 -j ACCEPT
+    limactl shell --workdir /tmp "$vm_name" sudo iptables -P OUTPUT DROP
   fi
 }
 
@@ -1475,7 +1479,7 @@ _devm_provision() {
   fi
 
   echo "Updating dev tools in '$vm_name'..."
-  echo "$DEVM_PROVISION_SCRIPT" | limactl shell "$vm_name" bash -l || {
+  echo "$DEVM_PROVISION_SCRIPT" | limactl shell --workdir /tmp "$vm_name" bash -l || {
     echo "Error: Provisioning failed." >&2
     return 1
   }
