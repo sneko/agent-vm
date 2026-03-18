@@ -834,16 +834,6 @@ _devm_ensure_running() {
     limactl shell --workdir "$first_vm_path" "$vm_name" zsh -l < "${first_folder}/.devm.runtime.sh"
   fi
 
-  # Install tool versions via mise if config files exist
-  for folder in "${folders[@]}"; do
-    if [[ -f "$folder/.tool-versions" || -f "$folder/.nvmrc" || -f "$folder/.node-version" || -f "$folder/.python-version" || -f "$folder/.mise.toml" ]]; then
-      local vm_folder
-      vm_folder="$(_devm_vm_path "$folder")"
-      echo "Installing tool versions for $(basename "$folder")..."
-      limactl shell --workdir "$vm_folder" "$vm_name" zsh -lc "mise install --yes" 2>/dev/null || true
-    fi
-  done
-
   # Security: apply per-mount protections
   while IFS= read -r raw_line; do
     [[ -z "$raw_line" ]] && continue
