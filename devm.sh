@@ -266,7 +266,16 @@ _devm_config_folders_raw() {
       continue
     fi
     if [[ $in_section -eq 1 ]] && [[ "$line" =~ ^mount=(.+)$ ]]; then
-      echo "$(_devm_resolve_path "${BASH_REMATCH[1]}")"
+      local resolved
+      resolved="$(_devm_resolve_path "${BASH_REMATCH[1]}")"
+      # Strip :rw/:ro suffix to check if path is a directory
+      local check_path="${resolved%:rw}"
+      check_path="${check_path%:ro}"
+      if [[ -d "$check_path" ]]; then
+        echo "$resolved"
+      else
+        echo "Warning: Skipping mount '$check_path' (not a directory)" >&2
+      fi
     fi
   done < "$DEVM_CONFIG"
 }
@@ -616,21 +625,24 @@ _devm_resolve_project() {
   local cwd
   cwd="$(pwd)"
 
+  # Determine workdir: map host cwd into /devm/ if it's within a mounted folder, else /devm/
+  _devm_resolve_workdir() {
+    local proj="$1" host_cwd="$2"
+    while IFS= read -r folder; do
+      [[ -z "$folder" ]] && continue
+      if [[ "$host_cwd" == "$folder" || "$host_cwd" == "$folder/"* ]]; then
+        DEVM_WORKDIR="$(_devm_vm_path "$host_cwd")"
+        return
+      fi
+    done <<< "$(_devm_config_folders "$proj")"
+    # cwd not within any mount — default to /devm/
+    DEVM_WORKDIR="/devm"
+  }
+
   # Check if candidate is a known project name
   if [[ -n "$candidate" ]] && _devm_config_has_project "$candidate"; then
     DEVM_PROJECT="$candidate"
-    # Determine workdir: if cwd is within a project folder, use it
-    DEVM_WORKDIR=""
-    local first_folder=""
-    while IFS= read -r folder; do
-      [[ -z "$folder" ]] && continue
-      [[ -z "$first_folder" ]] && first_folder="$folder"
-      if [[ "$cwd" == "$folder" || "$cwd" == "$folder/"* ]]; then
-        DEVM_WORKDIR="$(_devm_vm_path "$cwd")"
-        break
-      fi
-    done <<< "$(_devm_config_folders "$candidate")"
-    [[ -z "$DEVM_WORKDIR" ]] && DEVM_WORKDIR="$(_devm_vm_path "$first_folder")"
+    _devm_resolve_workdir "$candidate" "$cwd"
     return 0
   fi
 
@@ -638,11 +650,45 @@ _devm_resolve_project() {
   local detected
   if detected=$(_devm_find_project_for_dir "$cwd"); then
     DEVM_PROJECT="$detected"
-    DEVM_WORKDIR="$(_devm_vm_path "$cwd")"
+    _devm_resolve_workdir "$detected" "$cwd"
     return 0
   fi
 
   return 1
+}
+
+# Apply config (mounts, ports, security, resources) to a stopped VM
+# Writes mounts JSON to a temp file and uses yq-style --set to avoid shell arg limits
+_devm_apply_config() {
+  local vm_name="$1" project="$2" cpus="$3" memory="$4" disk="$5"
+
+  local mounts_json port_forwards_json
+  mounts_json=$(_devm_build_mounts "$project")
+  port_forwards_json=$(_devm_build_port_forwards "$project")
+
+  # Write JSON to temp files so they don't get truncated on the command line
+  local mounts_file ports_file
+  mounts_file=$(mktemp /tmp/devm-mounts-XXXXXX.json)
+  ports_file=$(mktemp /tmp/devm-ports-XXXXXX.json)
+  echo "$mounts_json" > "$mounts_file"
+  echo "$port_forwards_json" > "$ports_file"
+
+  # Apply mounts via load() to read from file
+  (cd /tmp && limactl edit "$vm_name" \
+    --set ".mounts = $(cat "$mounts_file")" \
+    --set '.ssh.forwardAgent = false' \
+    --memory "$memory" --cpus "$cpus") &>/dev/null
+  # Apply port forwards separately to keep each --set arg small
+  (cd /tmp && limactl edit "$vm_name" \
+    --set ".portForwards = $(cat "$ports_file")") &>/dev/null
+
+  rm -f "$mounts_file" "$ports_file"
+
+  if [[ -n "$disk" ]]; then
+    (cd /tmp && limactl edit "$vm_name" --disk "$disk") &>/dev/null || \
+      echo "Warning: Cannot set disk to ${disk} GiB." >&2
+  fi
+  _devm_print_resources "$vm_name"
 }
 
 # Ensure the VM exists and is running
@@ -717,38 +763,14 @@ _devm_ensure_running() {
   if ! _devm_exists "$vm_name"; then
     echo "Creating VM '$vm_name'..."
     limactl clone "$DEVM_TEMPLATE" "$vm_name" --tty=false &>/dev/null
-
-    local mounts_json port_forwards_json
-    mounts_json=$(_devm_build_mounts "$project")
-    port_forwards_json=$(_devm_build_port_forwards "$project")
-
-    local edit_args=()
-    edit_args+=(--set ".mounts = ${mounts_json}")
-    edit_args+=(--set ".portForwards = ${port_forwards_json}")
-    # Security: block host env forwarding and SSH agent to prevent data leaking
-    edit_args+=(--set '.propagateCurrentEnv = false')
-    edit_args+=(--set '.ssh.forwardAgent = false')
-    edit_args+=(--memory "$memory")
-    edit_args+=(--cpus "$cpus")
-    (cd /tmp && limactl edit "$vm_name" "${edit_args[@]}") &>/dev/null
-
-    if ! (cd /tmp && limactl edit "$vm_name" --disk "$disk") &>/dev/null; then
-      echo "Warning: Cannot set disk to ${disk} GiB (shrinking not supported). Re-run 'devm setup --disk ${disk}' for a smaller base." >&2
-    fi
-
-    _devm_print_resources "$vm_name"
-
+    _devm_apply_config "$vm_name" "$project" "$cpus" "$memory" "$disk"
     local base_ver="$DEVM_STATE_DIR/.devm-base-version"
     if [[ -f "$base_ver" ]]; then
       cp "$base_ver" "$DEVM_STATE_DIR/.devm-version-${vm_name}"
     fi
   else
     # VM already exists — sync config (mounts, ports, resources) before starting
-    # limactl edit requires VM to be stopped
-    local needs_stop=0
-
     if _devm_running "$vm_name"; then
-      needs_stop=1
       echo "Syncing VM config (mounts, ports, resources)..."
       echo "VM '$vm_name' must be stopped to apply config changes."
       printf "Stop and apply? [y/N] "
@@ -756,23 +778,12 @@ _devm_ensure_running() {
       read -r reply
       if [[ ! "$reply" =~ ^[Yy]$ ]]; then
         echo "Skipping config sync. Starting with current settings."
-        needs_stop=0
       else
         limactl stop "$vm_name" &>/dev/null
+        _devm_apply_config "$vm_name" "$project" "$cpus" "$memory" "$disk"
       fi
-    fi
-
-    if ! _devm_running "$vm_name"; then
-      local mounts_json port_forwards_json
-      mounts_json=$(_devm_build_mounts "$project")
-      port_forwards_json=$(_devm_build_port_forwards "$project")
-      local edit_args=(--set ".mounts = ${mounts_json}" --set ".portForwards = ${port_forwards_json}" --set '.propagateCurrentEnv = false' --set '.ssh.forwardAgent = false' --memory "$memory" --cpus "$cpus")
-      (cd /tmp && limactl edit "$vm_name" "${edit_args[@]}") &>/dev/null
-      if [[ -n "$disk" ]]; then
-        (cd /tmp && limactl edit "$vm_name" --disk "$disk") &>/dev/null || \
-          echo "Warning: Cannot set disk to ${disk} GiB." >&2
-      fi
-      _devm_print_resources "$vm_name"
+    else
+      _devm_apply_config "$vm_name" "$project" "$cpus" "$memory" "$disk"
     fi
   fi
 
@@ -997,7 +1008,7 @@ Config file (~/.devmconfig):
   Edit ~/.devmconfig directly to customize or backup your configuration.
 
 Security:
-  - Host environment is NOT forwarded (use env= to whitelist specific vars)
+  - Only whitelisted env vars are passed to the VM (use env.VAR in config)
   - Only explicitly listed ports are forwarded (auto-forwarding disabled)
   - Symlinks inside mounts cannot escape to the host filesystem
   - Writable mounts use nosymfollow to block symlink traversal
