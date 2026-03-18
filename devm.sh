@@ -798,26 +798,38 @@ _devm_ensure_running() {
     echo "Creating VM '$vm_name'..."
     limactl clone "$DEVM_TEMPLATE" "$vm_name" --tty=false &>/dev/null
     _devm_apply_config "$vm_name" "$project" "$cpus" "$memory" "$disk"
+    # Save config hash so we don't re-sync on next start
+    mkdir -p "$DEVM_STATE_DIR"
+    echo "${cpus}|${memory}|${disk}|$(_devm_build_mounts "$project")|$(_devm_build_port_forwards "$project")" | shasum -a 256 | cut -c1-16 > "$DEVM_STATE_DIR/.devm-config-hash-${vm_name}"
     local base_ver="$DEVM_STATE_DIR/.devm-base-version"
     if [[ -f "$base_ver" ]]; then
       cp "$base_ver" "$DEVM_STATE_DIR/.devm-version-${vm_name}"
     fi
   else
-    # VM already exists — sync config (mounts, ports, resources) before starting
-    if _devm_running "$vm_name"; then
-      echo "Syncing VM config (mounts, ports, resources)..."
-      echo "VM '$vm_name' must be stopped to apply config changes."
-      printf "Stop and apply? [y/N] "
-      local reply
-      read -r reply
-      if [[ ! "$reply" =~ ^[Yy]$ ]]; then
-        echo "Skipping config sync. Starting with current settings."
+    # VM already exists — sync config only if it changed
+    local config_hash
+    config_hash=$(echo "${cpus}|${memory}|${disk}|$(_devm_build_mounts "$project")|$(_devm_build_port_forwards "$project")" | shasum -a 256 | cut -c1-16)
+    local hash_file="$DEVM_STATE_DIR/.devm-config-hash-${vm_name}"
+    local old_hash=""
+    [[ -f "$hash_file" ]] && old_hash=$(cat "$hash_file")
+
+    if [[ "$config_hash" != "$old_hash" ]]; then
+      if _devm_running "$vm_name"; then
+        echo "Config changed. VM '$vm_name' must be stopped to apply."
+        printf "Stop and apply? [y/N] "
+        local reply
+        read -r reply
+        if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+          echo "Skipping config sync. Starting with current settings."
+        else
+          limactl stop "$vm_name" &>/dev/null
+          _devm_apply_config "$vm_name" "$project" "$cpus" "$memory" "$disk"
+          echo "$config_hash" > "$hash_file"
+        fi
       else
-        limactl stop "$vm_name" &>/dev/null
         _devm_apply_config "$vm_name" "$project" "$cpus" "$memory" "$disk"
+        echo "$config_hash" > "$hash_file"
       fi
-    else
-      _devm_apply_config "$vm_name" "$project" "$cpus" "$memory" "$disk"
     fi
   fi
 
