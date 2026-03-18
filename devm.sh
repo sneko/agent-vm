@@ -676,6 +676,26 @@ _devm_resolve_project() {
 _devm_apply_config() {
   local vm_name="$1" project="$2" cpus="$3" memory="$4" disk="$5"
 
+  # Warn about non-directory mount entries
+  local in_section=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      [[ "${BASH_REMATCH[1]}" == "$project" ]] && in_section=1 || in_section=0
+      continue
+    fi
+    if [[ $in_section -eq 1 ]] && [[ "$line" =~ ^mount=(.+)$ ]]; then
+      local raw_path="${BASH_REMATCH[1]}"
+      raw_path="${raw_path%:rw}"; raw_path="${raw_path%:ro}"
+      raw_path="${raw_path/#\~/$HOME}"
+      [[ "$raw_path" != /* ]] && raw_path="$(cd "$raw_path" 2>/dev/null && pwd || echo "$raw_path")"
+      if [[ ! -d "$raw_path" ]]; then
+        echo "Warning: Skipping mount '$raw_path' (not a directory)" >&2
+      fi
+    fi
+  done < "$DEVM_CONFIG"
+
   local mounts_json port_forwards_json
   mounts_json=$(_devm_build_mounts "$project")
   port_forwards_json=$(_devm_build_port_forwards "$project")
@@ -758,26 +778,6 @@ _devm_ensure_running() {
     [[ -n "$f" ]] && folders+=("$f")
   done <<< "$(_devm_config_folders "$project")"
 
-  # Check for non-directory mount entries in raw config
-  local in_section=0
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%%#*}"
-    line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
-      [[ "${BASH_REMATCH[1]}" == "$project" ]] && in_section=1 || in_section=0
-      continue
-    fi
-    if [[ $in_section -eq 1 ]] && [[ "$line" =~ ^mount=(.+)$ ]]; then
-      local raw_path="${BASH_REMATCH[1]}"
-      raw_path="${raw_path%:rw}"; raw_path="${raw_path%:ro}"
-      raw_path="${raw_path/#\~/$HOME}"
-      [[ "$raw_path" != /* ]] && raw_path="$(cd "$raw_path" 2>/dev/null && pwd || echo "$raw_path")"
-      if [[ ! -d "$raw_path" ]]; then
-        echo "Warning: Skipping mount '$raw_path' (not a directory)" >&2
-      fi
-    fi
-  done < "$DEVM_CONFIG"
-
   if [[ ${#folders[@]} -eq 0 ]]; then
     echo "Error: No folders configured for '$project' in $DEVM_CONFIG." >&2
     echo "" >&2
@@ -800,15 +800,16 @@ _devm_ensure_running() {
     _devm_apply_config "$vm_name" "$project" "$cpus" "$memory" "$disk"
     # Save config hash so we don't re-sync on next start
     mkdir -p "$DEVM_STATE_DIR"
-    echo "${cpus}|${memory}|${disk}|$(_devm_build_mounts "$project")|$(_devm_build_port_forwards "$project")" | shasum -a 256 | cut -c1-16 > "$DEVM_STATE_DIR/.devm-config-hash-${vm_name}"
+    sed -n "/^\[${project}\]$/,/^\[/p" "$DEVM_CONFIG" | sed '$d' | shasum -a 256 | cut -c1-16 > "$DEVM_STATE_DIR/.devm-config-hash-${vm_name}"
     local base_ver="$DEVM_STATE_DIR/.devm-base-version"
     if [[ -f "$base_ver" ]]; then
       cp "$base_ver" "$DEVM_STATE_DIR/.devm-version-${vm_name}"
     fi
   else
     # VM already exists — sync config only if it changed
+    # Hash the raw config section (fast) instead of computing mount JSON
     local config_hash
-    config_hash=$(echo "${cpus}|${memory}|${disk}|$(_devm_build_mounts "$project")|$(_devm_build_port_forwards "$project")" | shasum -a 256 | cut -c1-16)
+    config_hash=$(sed -n "/^\[${project}\]$/,/^\[/p" "$DEVM_CONFIG" | sed '$d' | shasum -a 256 | cut -c1-16)
     local hash_file="$DEVM_STATE_DIR/.devm-config-hash-${vm_name}"
     local old_hash=""
     [[ -f "$hash_file" ]] && old_hash=$(cat "$hash_file")
