@@ -13,11 +13,11 @@
 # Usage:
 #   devm setup                 - Create the base VM template (run once)
 #   devm create <name> [dirs]  - Add a VM definition to ~/.devmconfig
-#   devm shell [name]          - Open a shell in the VM
-#   devm run [name] <cmd>      - Run a command in the VM
-#   devm provision [name]      - Update dev tools in a running VM
-#   devm stop [name]           - Stop the VM
-#   devm rm [name]             - Destroy the VM (keeps config)
+#   devm shell <name>          - Open a shell in the VM
+#   devm run <name> <cmd>      - Run a command in the VM
+#   devm provision <name>      - Update dev tools in a running VM
+#   devm stop <name>           - Stop the VM
+#   devm rm <name>             - Destroy the VM (keeps config)
 #   devm list                  - List all devm VMs
 #   devm status                - Show status of all VMs
 #   devm help                  - Show help
@@ -463,6 +463,22 @@ _devm_config_write_project() {
   mv "$tmpfile" "$DEVM_CONFIG"
 }
 
+# Remove a project section from the config file
+_devm_config_remove_project() {
+  local name="$1"
+  [[ -f "$DEVM_CONFIG" ]] || return 0
+  local tmpfile
+  tmpfile=$(mktemp)
+  local skip=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      [[ "${BASH_REMATCH[1]}" == "$name" ]] && skip=1 || skip=0
+    fi
+    [[ $skip -eq 0 ]] && echo "$line" >> "$tmpfile"
+  done < "$DEVM_CONFIG"
+  mv "$tmpfile" "$DEVM_CONFIG"
+}
+
 # ─── VM helpers ─────────────────────────────────────────────────────────────
 
 _devm_vm_name() {
@@ -666,18 +682,10 @@ _devm_resolve_project() {
     DEVM_WORKDIR="/devm"
   }
 
-  # Check if candidate is a known project name
+  # Name must be provided and valid
   if [[ -n "$candidate" ]] && _devm_config_has_project "$candidate"; then
     DEVM_PROJECT="$candidate"
     _devm_resolve_workdir "$candidate" "$cwd"
-    return 0
-  fi
-
-  # Auto-detect from cwd
-  local detected
-  if detected=$(_devm_find_project_for_dir "$cwd"); then
-    DEVM_PROJECT="$detected"
-    _devm_resolve_workdir "$detected" "$cwd"
     return 0
   fi
 
@@ -1024,11 +1032,12 @@ Usage: devm [options] <command> [args]
 Commands:
   setup                           Create the base VM template (run once)
   create <name> [dirs] [opts]     Add/update a VM definition in ~/.devmconfig
-  shell [name]                    Open a shell in the VM
-  run [name] <cmd> [args]         Run a command in the VM
-  provision [name]                Update dev tools in a running VM
-  stop [name]                     Stop the VM
-  rm [name]                       Destroy the VM (keeps config entry)
+  shell <name>                    Open a shell in the VM
+  run <name> <cmd> [args]         Run a command in the VM
+  provision <name>                Update dev tools in a running VM
+  stop <name>                     Stop the VM
+  rm <name>                       Destroy the VM (keeps config entry)
+  rm <name> --forget              Destroy the VM and remove config entry
   destroy-all                     Destroy all devm VMs
   list                            List all devm VMs
   status                          Show status of all VMs
@@ -1041,10 +1050,6 @@ Options (for shell, run):
   --reset            Destroy and re-clone the VM from the base template
   --offline          Block outbound internet (keeps host/VM communication)
   --rm               Destroy the VM after the command exits
-
-Name resolution:
-  If [name] is omitted, devm auto-detects it by matching your current
-  directory against folders listed in ~/.devmconfig.
 
 Config file (~/.devmconfig):
   Each section defines a named VM with folders to mount:
@@ -1107,7 +1112,7 @@ Examples:
   devm --offline shell myapp                    # No internet access
   devm --rm run myapp npm test                  # Destroy VM after test
   devm --reset shell myapp                      # Fresh VM from template
-  devm shell                                    # Auto-detect VM from cwd
+  devm stop myapp                                # Stop the VM
 
 Customization:
   ~/.devm/setup.sh                Per-user setup (runs during "devm setup")
@@ -1416,7 +1421,7 @@ _devm_resolve_project_arg() {
     echo "$arg"
     return 0
   fi
-  _devm_find_project_for_dir "$(pwd)"
+  return 1
 }
 
 # Print a helpful error when no VM can be resolved
@@ -1427,17 +1432,15 @@ _devm_error_no_vm() {
   if [[ -n "$attempted" ]]; then
     echo "Error: Unknown VM name '$attempted'." >&2
   else
-    echo "Error: Cannot determine which VM to use." >&2
-    echo "  Current directory ($(pwd)) does not match any VM in $DEVM_CONFIG." >&2
+    echo "Error: No VM name specified." >&2
   fi
   echo "" >&2
-  echo "Either specify a VM name or cd into a configured folder:" >&2
-  echo "  devm $cmd <name>" >&2
+  echo "Usage: devm $cmd <name>" >&2
   echo "" >&2
   local projects
   projects=$(_devm_config_projects 2>/dev/null)
   if [[ -n "$projects" ]]; then
-    echo "Available VMs:" >&2
+    echo "Configured VMs (in $DEVM_CONFIG):" >&2
     echo "$projects" | while read -r p; do
       echo "  - $p" >&2
     done
@@ -1458,7 +1461,7 @@ _devm_provision() {
         echo ""
         echo "Examples:"
         echo "  devm provision myapp"
-        echo "  devm provision           # auto-detect from current directory"
+        echo "  devm provision myapp"
         return 0
         ;;
       *)
@@ -1519,10 +1522,19 @@ _devm_stop() {
 }
 
 _devm_destroy() {
+  local forget=0
+  local name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --forget) forget=1; shift ;;
+      *) name="$1"; shift ;;
+    esac
+  done
+
   local project
-  project=$(_devm_resolve_project_arg "$1")
+  project=$(_devm_resolve_project_arg "$name")
   if [[ -z "$project" ]]; then
-    _devm_error_no_vm "rm" "$1"
+    _devm_error_no_vm "rm" "$name"
     return 1
   fi
 
@@ -1530,9 +1542,15 @@ _devm_destroy() {
   vm_name=$(_devm_vm_name "$project")
 
   if ! _devm_exists "$vm_name"; then
+    if [[ $forget -eq 1 ]]; then
+      _devm_config_remove_project "$project"
+      echo "Config entry for '$project' removed from $DEVM_CONFIG"
+      return 0
+    fi
     echo "Error: No VM exists for '$project'." >&2
     echo "" >&2
     echo "Nothing to destroy. The config entry in $DEVM_CONFIG is unchanged." >&2
+    echo "Use 'devm rm $project --forget' to also remove the config entry." >&2
     return 1
   fi
 
@@ -1540,7 +1558,15 @@ _devm_destroy() {
   limactl stop "$vm_name" &>/dev/null
   limactl delete "$vm_name" --force &>/dev/null
   rm -f "$DEVM_STATE_DIR/.devm-version-${vm_name}"
-  echo "VM destroyed. Config entry for '$project' kept in $DEVM_CONFIG"
+  rm -f "$DEVM_STATE_DIR/.devm-config-hash-${vm_name}"
+
+  if [[ $forget -eq 1 ]]; then
+    _devm_config_remove_project "$project"
+    echo "VM destroyed and config entry removed from $DEVM_CONFIG"
+  else
+    echo "VM destroyed. Config entry for '$project' kept in $DEVM_CONFIG"
+    echo "  Use 'devm rm $project --forget' to also remove the config entry."
+  fi
 }
 
 # Helper for --rm cleanup
