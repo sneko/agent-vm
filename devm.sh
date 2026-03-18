@@ -840,6 +840,7 @@ _devm_ensure_running() {
     echo "Warning: Base VM updated since this VM was cloned. Use --reset to re-clone." >&2
   fi
 
+  local just_started=0
   if ! _devm_running "$vm_name"; then
     echo "Starting VM '$vm_name'..."
     limactl start "$vm_name" 2>/dev/null
@@ -847,24 +848,27 @@ _devm_ensure_running() {
       echo "Error: VM failed to start. Check 'limactl list' and try 'devm --reset shell $project'." >&2
       return 1
     fi
+    just_started=1
   fi
 
-  # Determine first folder for runtime scripts
-  local first_folder="${folders[0]}"
-  local first_vm_path
-  first_vm_path="$(_devm_vm_path "$first_folder")"
+  # Only run post-start setup on fresh start (not when VM is already running)
+  if [[ $just_started -eq 1 ]]; then
+    # Determine first folder for runtime scripts
+    local first_folder="${folders[0]}"
+    local first_vm_path
+    first_vm_path="$(_devm_vm_path "$first_folder")"
 
-  # Run per-user runtime script
-  if [[ -f "$DEVM_STATE_DIR/runtime.sh" ]]; then
-    echo "Running user runtime setup..."
-    limactl shell --workdir "$first_vm_path" "$vm_name" zsh -l < "$DEVM_STATE_DIR/runtime.sh"
-  fi
+    # Run per-user runtime script
+    if [[ -f "$DEVM_STATE_DIR/runtime.sh" ]]; then
+      echo "Running user runtime setup..."
+      limactl shell --workdir "$first_vm_path" "$vm_name" zsh -l < "$DEVM_STATE_DIR/runtime.sh"
+    fi
 
-  # Run project-specific runtime script
-  if [[ -f "${first_folder}/.devm.runtime.sh" ]]; then
-    echo "Running directory runtime setup..."
-    limactl shell --workdir "$first_vm_path" "$vm_name" zsh -l < "${first_folder}/.devm.runtime.sh"
-  fi
+    # Run project-specific runtime script
+    if [[ -f "${first_folder}/.devm.runtime.sh" ]]; then
+      echo "Running directory runtime setup..."
+      limactl shell --workdir "$first_vm_path" "$vm_name" zsh -l < "${first_folder}/.devm.runtime.sh"
+    fi
 
   # Security: apply per-mount protections
   while IFS= read -r raw_line; do
@@ -910,6 +914,8 @@ _devm_ensure_running() {
       fi
     fi
   done <<< "$(_devm_config_folders_raw "$project")"
+
+  fi  # end just_started
 
   # Offline mode
   if [[ -n "$offline" ]]; then
