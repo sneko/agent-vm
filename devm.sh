@@ -55,6 +55,15 @@ sudo chsh -s /usr/bin/zsh "$(whoami)"
 
 # Enable zsh plugins and colors
 cat >> ~/.zshrc << 'ZSHRC'
+# History — persists across shell sessions and VM restarts
+HISTFILE=~/.zsh_history
+HISTSIZE=10000
+SAVEHIST=10000
+setopt APPEND_HISTORY
+setopt INC_APPEND_HISTORY
+setopt SHARE_HISTORY
+setopt HIST_IGNORE_SPACE
+
 # Syntax highlighting and autosuggestions
 [ -f /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh ] && source /usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
 [ -f /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh ] && source /usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh
