@@ -488,6 +488,7 @@ _devm_build_mounts() {
   local project="$1"
   local mounts="["
   local first=1
+  local count=0
   local raw_line folder mode writable host_path vm_mount
 
   while IFS= read -r raw_line; do
@@ -515,9 +516,24 @@ _devm_build_mounts() {
 
     [[ $first -eq 1 ]] && first=0 || mounts+=","
     mounts+="{\"location\":\"${host_path}\",\"mountPoint\":\"${vm_mount}\",\"writable\":${writable},\"sshfs\":{\"followSymlinks\":false}}"
+    count=$((count + 1))
   done <<< "$(_devm_config_folders_raw "$project")"
 
   mounts+="]"
+
+  if [[ $count -gt 18 ]]; then
+    echo "Warning: $count mounts configured — Apple Virtualization limits to ~18 mounts." >&2
+    echo "  The VM will likely fail to start." >&2
+    echo "" >&2
+    echo "  Edit $DEVM_CONFIG and comment out mounts you don't need right now:" >&2
+    echo "    # mount=~/code/inactive-project    (deps already installed stay in the VM)" >&2
+    echo "" >&2
+    echo "  If grouping under a parent directory (mount=~/code), use an explicit mode:" >&2
+    echo "    mount=~/code:rw    or    mount=~/code:ro" >&2
+    echo "  Without a mode, per-folder git detection won't apply to a parent mount" >&2
+    echo "  (the mode will be the same for all subfolders)." >&2
+  fi
+
   echo "$mounts"
 }
 
@@ -814,7 +830,11 @@ _devm_ensure_running() {
 
   if ! _devm_running "$vm_name"; then
     echo "Starting VM '$vm_name'..."
-    limactl start "$vm_name" &>/dev/null
+    limactl start "$vm_name" 2>/dev/null
+    if ! _devm_running "$vm_name"; then
+      echo "Error: VM failed to start. Check 'limactl list' and try 'devm --reset shell $project'." >&2
+      return 1
+    fi
   fi
 
   # Determine first folder for runtime scripts
@@ -853,6 +873,29 @@ _devm_ensure_running() {
       echo "Protecting .git in $(basename "$folder")..."
       limactl shell "$vm_name" sudo mount --bind "$vm_folder/.git" "$vm_folder/.git" 2>/dev/null
       limactl shell "$vm_name" sudo mount -o remount,ro,bind "$vm_folder/.git" 2>/dev/null
+    fi
+
+    # Hide host dependency dirs (wrong architecture) with persistent VM-local overlays
+    # Deps installed in the VM are stored on the VM disk and survive stop/start
+    if [[ "$mode" != "ro" ]]; then
+      local dep_dirs=("node_modules" "vendor" ".venv" "venv" "__pycache__" ".bundle" "target" "build" "dist")
+      for dep in "${dep_dirs[@]}"; do
+        if [[ -d "$folder/$dep" ]]; then
+          echo "  Overlaying $dep in $(basename "$folder")..."
+          limactl shell "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${dep}\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${dep}\" \"${vm_folder}/${dep}\"" 2>/dev/null
+        fi
+      done
+      # Also handle nested node_modules in monorepos (one level deep)
+      if [[ -d "$folder/.git" ]]; then
+        for subdir in "$folder"/*/; do
+          local subname
+          subname=$(basename "$subdir")
+          if [[ -d "$subdir/node_modules" && "$subname" != "node_modules" ]]; then
+            echo "  Overlaying node_modules in $(basename "$folder")/$subname..."
+            limactl shell "$vm_name" bash -c "mkdir -p \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" && sudo mount --bind \"\$HOME/.devm-deps${vm_folder}/${subname}/node_modules\" \"${vm_folder}/${subname}/node_modules\"" 2>/dev/null
+          fi
+        done
+      fi
     fi
   done <<< "$(_devm_config_folders_raw "$project")"
 
