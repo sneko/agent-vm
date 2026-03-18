@@ -742,29 +742,37 @@ _devm_ensure_running() {
     if [[ -f "$base_ver" ]]; then
       cp "$base_ver" "$DEVM_STATE_DIR/.devm-version-${vm_name}"
     fi
-  elif [[ -n "$disk" || -n "$memory" || -n "$cpus" ]]; then
-    # Resize existing VM
+  else
+    # VM already exists — sync config (mounts, ports, resources) before starting
+    # limactl edit requires VM to be stopped
+    local needs_stop=0
+
     if _devm_running "$vm_name"; then
-      echo "VM '$vm_name' is running. Must stop to apply resource changes."
+      needs_stop=1
+      echo "Syncing VM config (mounts, ports, resources)..."
+      echo "VM '$vm_name' must be stopped to apply config changes."
       printf "Stop and apply? [y/N] "
       local reply
       read -r reply
       if [[ ! "$reply" =~ ^[Yy]$ ]]; then
-        echo "Aborted. Starting with current settings."
+        echo "Skipping config sync. Starting with current settings."
+        needs_stop=0
       else
         limactl stop "$vm_name" &>/dev/null
-
-        local mounts_json port_forwards_json
-        mounts_json=$(_devm_build_mounts "$project")
-        port_forwards_json=$(_devm_build_port_forwards "$project")
-        local edit_args=(--set ".mounts = ${mounts_json}" --set ".portForwards = ${port_forwards_json}" --set '.propagateCurrentEnv = false' --set '.ssh.forwardAgent = false' --memory "$memory" --cpus "$cpus")
-        (cd /tmp && limactl edit "$vm_name" "${edit_args[@]}") &>/dev/null
-        if [[ -n "$disk" ]]; then
-          (cd /tmp && limactl edit "$vm_name" --disk "$disk") &>/dev/null || \
-            echo "Warning: Cannot set disk to ${disk} GiB." >&2
-        fi
-        _devm_print_resources "$vm_name"
       fi
+    fi
+
+    if ! _devm_running "$vm_name"; then
+      local mounts_json port_forwards_json
+      mounts_json=$(_devm_build_mounts "$project")
+      port_forwards_json=$(_devm_build_port_forwards "$project")
+      local edit_args=(--set ".mounts = ${mounts_json}" --set ".portForwards = ${port_forwards_json}" --set '.propagateCurrentEnv = false' --set '.ssh.forwardAgent = false' --memory "$memory" --cpus "$cpus")
+      (cd /tmp && limactl edit "$vm_name" "${edit_args[@]}") &>/dev/null
+      if [[ -n "$disk" ]]; then
+        (cd /tmp && limactl edit "$vm_name" --disk "$disk") &>/dev/null || \
+          echo "Warning: Cannot set disk to ${disk} GiB." >&2
+      fi
+      _devm_print_resources "$vm_name"
     fi
   fi
 
