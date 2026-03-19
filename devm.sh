@@ -563,6 +563,7 @@ _devm_build_mounts() {
 }
 
 # Build Lima portForwards JSON from config ports= setting
+# Supports individual ports (3000) and ranges (7200-7206)
 # Disables automatic port forwarding; only listed ports are forwarded to localhost
 _devm_build_port_forwards() {
   local project="$1"
@@ -575,11 +576,21 @@ _devm_build_port_forwards() {
   # Add explicit port forwards
   if [[ -n "$ports_str" ]]; then
     IFS=',' read -ra port_list <<< "$ports_str"
-    for port in "${port_list[@]}"; do
-      port="$(echo "$port" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-      [[ -z "$port" ]] && continue
-      [[ $first -eq 1 ]] && first=0 || forwards+=","
-      forwards+="{\"guestPort\":${port},\"hostPort\":${port},\"guestIP\":\"127.0.0.1\",\"hostIP\":\"127.0.0.1\",\"proto\":\"tcp\"}"
+    for entry in "${port_list[@]}"; do
+      entry="$(echo "$entry" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      [[ -z "$entry" ]] && continue
+      if [[ "$entry" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        # Port range: 7200-7206
+        local from="${BASH_REMATCH[1]}" to="${BASH_REMATCH[2]}"
+        for (( port=from; port<=to; port++ )); do
+          [[ $first -eq 1 ]] && first=0 || forwards+=","
+          forwards+="{\"guestPort\":${port},\"hostPort\":${port},\"guestIP\":\"127.0.0.1\",\"hostIP\":\"127.0.0.1\",\"proto\":\"tcp\"}"
+        done
+      else
+        # Single port
+        [[ $first -eq 1 ]] && first=0 || forwards+=","
+        forwards+="{\"guestPort\":${entry},\"hostPort\":${entry},\"guestIP\":\"127.0.0.1\",\"hostIP\":\"127.0.0.1\",\"proto\":\"tcp\"}"
+      fi
     done
   fi
 
@@ -1078,7 +1089,7 @@ Config file (~/.devmconfig):
     cpus=N              Number of CPUs
     memory=N            Memory in GiB
     disk=N              Disk in GiB
-    ports=P1,P2,...     Ports to forward from VM to host (localhost only)
+    ports=P1,P2,...     Ports to forward (supports ranges: 7200-7206)
 
   Environment variables (env.*):
     env.VAR             Forward VAR from host environment
