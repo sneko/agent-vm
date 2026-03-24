@@ -912,11 +912,6 @@ _devm_ensure_running() {
     folder="${folder%:ro}"
     vm_folder="$(_devm_vm_path "$folder")"
 
-    # Protect writable mounts against symlink escape (nosymfollow, Linux 5.10+)
-    if [[ "$mode" == "rw" ]] || { [[ "$mode" == "auto" ]] && [[ -d "$folder/.git" ]]; }; then
-      limactl shell --workdir /tmp "$vm_name" sudo mount -o remount,nosymfollow "$vm_folder" < /dev/null 2>/dev/null || true
-    fi
-
     # Bind-mount .git as read-only for writable git folders
     if [[ "$mode" != "ro" ]] && [[ -d "$folder/.git" ]]; then
       echo "Protecting .git in $(basename "$folder")..."
@@ -1109,8 +1104,7 @@ Config file (~/.devmconfig):
 Security:
   - Only whitelisted env vars are passed to the VM (use env.VAR in config)
   - Only explicitly listed ports are forwarded (auto-forwarding disabled)
-  - Symlinks inside mounts cannot escape to the host filesystem
-  - Writable mounts use nosymfollow to block symlink traversal
+  - Symlinks inside mounts cannot escape to the host (virtiofsd sandboxing)
   - SSH agent forwarding is disabled (VM cannot access host credentials)
   - .git directories are bind-mounted read-only in writable git repos
   - Non-git folders are read-only by default
